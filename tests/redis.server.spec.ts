@@ -124,12 +124,18 @@ describe('RedisStreamStrategy', () => {
   });
 
   describe('registerStream', () => {
-    it('should return false if the pattern is not a Redis stream handler', async () => {
-      const pattern = JSON.stringify({ isRedisStreamHandler: false });
+    it('should register the stream name and return true', async () => {
+      const pattern = 'mystream';
+
+      // mock get message handler
+      server.messageHandlers.get = jest.fn().mockReturnValue(() => true);
+      // ensure createConsumerGroup does not throw
+      server['createConsumerGroup'] = jest.fn().mockResolvedValue(true);
 
       const result = await server['registerStream'](pattern);
 
-      expect(result).toBe(false);
+      expect(result).toBe(true);
+      expect(server.streamHandlerMap['mystream']).toBeDefined();
     });
 
     it('should add the message handler to the stream handler map and return true', async () => {
@@ -137,34 +143,16 @@ describe('RedisStreamStrategy', () => {
 
       // mock get message handler
       server.messageHandlers.get = jest.fn().mockReturnValue(() => true);
+      server['createConsumerGroup'] = jest.fn().mockResolvedValue(true);
 
-      const patternObj = JSON.stringify({
-        isRedisStreamHandler: true,
-        stream: mockStream,
-      });
-
-      const result = await server['registerStream'](patternObj);
+      const result = await server['registerStream'](mockStream);
 
       expect(result).toBe(true);
       expect(server.streamHandlerMap['mystream']).toBeDefined();
     });
 
-    it('should catch and log any errors thrown by JSON.parse', async () => {
-      const pattern = 'invalid pattern';
-      // mock logger
-      server.logger.debug = jest.fn().mockReturnThis();
-
-      const result = await server['registerStream'](pattern);
-
-      expect(result).toBe(false);
-      expect(server['logger']['debug']).toHaveBeenCalled();
-    });
-
     it('should call createConsumerGroup with the correct arguments', async () => {
-      const pattern = JSON.stringify({
-        isRedisStreamHandler: true,
-        stream: 'mystream',
-      });
+      const pattern = 'mystream';
 
       const mockCreateConsumerGroup = (server['createConsumerGroup'] =
         jest.fn());
