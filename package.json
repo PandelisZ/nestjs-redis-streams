@@ -1,6 +1,6 @@
 {
   "name": "@pandelis/nestjs-redis-streams",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "Redis Streams Transport for NestJS.",
   "author": "Pandelis Zembashis <p@ndel.is>",
   "private": false,
@@ -10,12 +10,12 @@
     "lib": "lib"
   },
   "scripts": {
-    "prebuild": "rimraf dist",
+    "prebuild": "rm -rf dist",
     "build": "tsc -p tsconfig.json",
     "format": "prettier **/**/*.ts --ignore-path ./.prettierignore --write",
     "test": "jest",
     "test:cov": "jest --coverage",
-    "deploy": "npm publish --access public"
+    "deploy": "pnpm run build && npm publish --access public"
   },
   "repository": {
     "type": "git",

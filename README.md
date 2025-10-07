@@ -120,11 +120,11 @@ bootstrap();
 
 ### In one of your controllers where you want to handle the messages coming from a stream.
 
-<p> Use our decorator @RedisStreamHandler("users-1") to tell the lib to register this handler and listen on that "users-1" stream and whenever it receive a message, this handler will be called with the data and a created message context.
-</p>
+This fork is a direct replacement for @EventPattern rather than introducing a new decorator.
+Use our decorator @EventPattern("users-1") to tell the lib to register this handler and listen on that "users-1" stream and whenever it receive a message, this handler will be called with the data and a created message context.
 
 ```ts
-import { Ctx, Payload } from '@nestjs/microservices';
+import { Ctx, Payload, EventPattern } from '@nestjs/microservices';
 import {
   RedisStreamHandler,
   StreamResponse,
@@ -132,7 +132,7 @@ import {
 } from '@tamimaj/nestjs-redis-streams';
 
 export class UsersEventHandlers {
-  @RedisStreamHandler('users:create') // stream name.
+  @EventPattern('users:create') // stream name.
   async handleUserCreate(@Payload() data: any, @Ctx() ctx: RedisStreamContext) {
     console.log('Handler users:create called with payload: ', data);
     console.log('Headers: ', ctx.getMessageHeaders());

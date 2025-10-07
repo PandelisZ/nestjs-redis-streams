@@ -7,7 +7,6 @@ export type RedisConnectionOptions = Redis.RedisOptions & { url?: string };
 export type RedisInstance = Redis.Redis;
 
 export interface RedisStreamPattern {
-  isRedisStreamHandler: boolean;
   stream: string;
 }
 

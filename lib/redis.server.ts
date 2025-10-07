@@ -88,16 +88,10 @@ export class RedisStreamStrategy
 
   private async registerStream(pattern: string) {
     try {
-      const parsedPattern: RedisStreamPattern = JSON.parse(pattern);
-
-      if (!parsedPattern.isRedisStreamHandler) return false;
-
-      const { stream } = parsedPattern;
-
-      this.streamHandlerMap[stream] = this.messageHandlers.get(pattern);
+      this.streamHandlerMap[pattern] = this.messageHandlers.get(pattern);
 
       await this.createConsumerGroup(
-        stream,
+        pattern,
         this.options?.streams?.consumerGroup,
       );
 
