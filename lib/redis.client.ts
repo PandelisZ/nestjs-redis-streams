@@ -47,10 +47,10 @@ export class RedisStreamClient extends ClientProxy {
       this.redis.on(CONNECT_EVENT, () => {
         this.logger.log(
           'Redis Client Responses Listener connected successfully on ' +
-            (this.options.connection?.url ??
-              this.options.connection?.host +
-                ':' +
-                this.options.connection?.port),
+          (this.options.connection?.url ??
+            this.options.connection?.host +
+            ':' +
+            this.options.connection?.port),
         );
 
         this.initListener();
@@ -119,7 +119,7 @@ export class RedisStreamClient extends ClientProxy {
         commandArgs.push(this.options.streams.maxLen.toString());
       }
       commandArgs.push('*');
-      let response = await this.client.xadd(
+      const response = await this.client.xadd(
         stream,
         ...commandArgs,
         ...serializedPayloadArray,
@@ -135,7 +135,7 @@ export class RedisStreamClient extends ClientProxy {
       const stream = partialPacket.pattern;
 
       // placeholder outgoing context.
-      let ctx = new RedisStreamContext([
+      const ctx = new RedisStreamContext([
         stream, // stream
         null, // messageId
         null, // consumer group
@@ -167,7 +167,7 @@ export class RedisStreamClient extends ClientProxy {
       }
 
       // handle xadd.
-      let response = await this.handleXadd(stream, serializedEntries);
+      const response = await this.handleXadd(stream, serializedEntries);
       return response;
     } catch (error) {
       this.logger.error(error);
@@ -249,9 +249,9 @@ export class RedisStreamClient extends ClientProxy {
       if (error instanceof Error && error?.message.includes('BUSYGROUP')) {
         this.logger.debug(
           'Consumer Group "' +
-            consumerGroup +
-            '" already exists for stream: ' +
-            stream,
+          consumerGroup +
+          '" already exists for stream: ' +
+          stream,
         );
         return true;
       } else {
@@ -281,8 +281,8 @@ export class RedisStreamClient extends ClientProxy {
       // if BLOCK time ended, and results are null, listen again.
       if (!results) return this.listenOnStreams();
 
-      for (let result of results) {
-        let [stream, messages] = result;
+      for (const result of results) {
+        const [stream, messages] = result;
         await this.notifyHandlers(stream, messages);
       }
 
@@ -298,7 +298,7 @@ export class RedisStreamClient extends ClientProxy {
         messages.map(async (message) => {
           // for each message, deserialize and get the handler.
 
-          let ctx = new RedisStreamContext([
+          const ctx = new RedisStreamContext([
             stream,
             message[0], // message id needed for ACK.
             this.options?.streams?.consumerGroup,
@@ -327,7 +327,7 @@ export class RedisStreamClient extends ClientProxy {
 
             this.logger.debug(
               'No callback found for a message with correlationId: ' +
-                correlationId,
+              correlationId,
             );
             return;
           } else {
@@ -359,7 +359,7 @@ export class RedisStreamClient extends ClientProxy {
 
         this.logger.debug(
           'No callback found for a message with correlationId: ' +
-            correlationId,
+          correlationId,
         );
         return;
       }
