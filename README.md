@@ -1,5 +1,12 @@
 # @tamimaj/nestjs-redis-streams
 
+Note about this fork
+- This repository is a maintained fork of https://github.com/tamimaj/nestjs-redis-streams. Full credit to @tamimaj (Tamim Abbas Aljuratli) for the original implementation and design.
+- Goal: keep this package up to date for NestJS 11+ and provide a drop-in replacement for the built-in microservice Redis transport. This fork aims to integrate with Nest’s shutdown lifecycle to support drain/stop-consumption semantics and graceful, high-availability (HA) stream processing: pause consumption, finish in-flight work, ACK safely, and close Redis connections cleanly.
+
+Status
+- Work is ongoing toward lifecycle-driven draining and HA-safe shutdown. The public API and general usage remain compatible with the original package so you can adopt this as an in-place drop-in.
+
 <p align="center">
   <a href="http://nestjs.com/" target="blank">
     <img src="https://nestjs.com/img/logo_text.svg" width="320" alt="Nest Logo" />

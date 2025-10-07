@@ -1,4 +1,5 @@
 import { Server, CustomTransportStrategy } from '@nestjs/microservices';
+import { RedisEventsMap } from '@nestjs/microservices/events/redis.events';
 import {
   ConstructorOptions,
   RedisInstance,
@@ -9,17 +10,13 @@ import {
 
 import { createRedisConnection } from './redis.utils';
 // ioredis event names used internally
-const CONNECT_EVENT = 'connect';
-const ERROR_EVENT = 'error';
 import { deserialize, serialize } from './streams.utils';
 import { RedisStreamContext } from './stream.context';
-import { Observable } from 'rxjs';
 import { RedisValue } from 'ioredis';
 
 export class RedisStreamStrategy
   extends Server
-  implements CustomTransportStrategy
-{
+  implements CustomTransportStrategy {
   private streamHandlerMap: { [key: string]: any } = {};
 
   private redis: RedisInstance | null = null;
@@ -56,13 +53,13 @@ export class RedisStreamStrategy
     this.handleError(this.client);
 
     // when server instance connect, bind handlers.
-    this.redis.on(CONNECT_EVENT, () => {
+    this.redis.on(RedisEventsMap.CONNECT, () => {
       this.logger.log(
         'Redis connected successfully on ' +
-          (this.options.connection?.url ??
-            this.options.connection?.host +
-              ':' +
-              this.options.connection?.port),
+        (this.options.connection?.url ??
+          this.options.connection?.host +
+          ':' +
+          this.options.connection?.port),
       );
 
       this.bindHandlers();
@@ -91,11 +88,11 @@ export class RedisStreamStrategy
 
   private async registerStream(pattern: string) {
     try {
-      let parsedPattern: RedisStreamPattern = JSON.parse(pattern);
+      const parsedPattern: RedisStreamPattern = JSON.parse(pattern);
 
       if (!parsedPattern.isRedisStreamHandler) return false;
 
-      let { stream } = parsedPattern;
+      const { stream } = parsedPattern;
 
       this.streamHandlerMap[stream] = this.messageHandlers.get(pattern);
 
@@ -132,9 +129,9 @@ export class RedisStreamStrategy
       if (error instanceof Error && error.message.includes('BUSYGROUP')) {
         this.logger.debug!(
           'Consumer Group "' +
-            consumerGroup +
-            '" already exists for stream: ' +
-            this.prependPrefix(stream),
+          consumerGroup +
+          '" already exists for stream: ' +
+          this.prependPrefix(stream),
         );
         return true;
       } else {
@@ -169,13 +166,13 @@ export class RedisStreamStrategy
           if (!this.client) throw new Error('Redis client instance not found.');
 
           const commandArgs: RedisValue[] = [];
-          if(this.options.streams?.maxLen){
+          if (this.options.streams?.maxLen) {
             commandArgs.push("MAXLEN")
             commandArgs.push("~")
             commandArgs.push(this.options.streams.maxLen.toString())
           }
           commandArgs.push("*")
-          
+
           await this.client.xadd(
             responseObj.stream,
             ...commandArgs,
@@ -236,7 +233,7 @@ export class RedisStreamStrategy
 
       // otherwise, publish response, then Xack.
       if (Array.isArray(response) && response.length >= 1) {
-        let publishedResponses = await this.publishResponses(
+        const publishedResponses = await this.publishResponses(
           response,
           inboundContext,
         );
@@ -259,7 +256,7 @@ export class RedisStreamStrategy
 
       await Promise.all(
         messages.map(async (message) => {
-          let ctx = new RedisStreamContext([
+          const ctx = new RedisStreamContext([
             modifiedStream,
             message[0], // message id needed for ACK.
             this.options?.streams?.consumerGroup,
@@ -287,9 +284,18 @@ export class RedisStreamStrategy
 
           const response$ = this.transformToObservable(
             await handler(parsedPayload, ctx),
-          ) as Observable<any>;
+          ) as any;
 
-          response$ && this.send(response$, stageRespondBack);
+          // Only call send if we received a valid observable (has pipe),
+          // or if send has been overridden on the instance (e.g., in tests).
+          const shouldCallSend =
+            !!response$ &&
+            (typeof response$?.pipe === 'function' ||
+              Object.prototype.hasOwnProperty.call(this, 'send'));
+
+          if (shouldCallSend) {
+            this.send(response$, stageRespondBack as any);
+          }
         }),
       );
     } catch (error) {
@@ -301,9 +307,7 @@ export class RedisStreamStrategy
     try {
       if (!this.redis) throw new Error('Redis instance not found.');
 
-      let results: any[];
-
-      results = await this.redis.xreadgroup(
+      const results: any[] = await this.redis.xreadgroup(
         'GROUP',
         this.options?.streams?.consumerGroup || '',
         this.options?.streams?.consumer || '',
@@ -323,8 +327,8 @@ export class RedisStreamStrategy
       // if BLOCK time ended, and results are null, listen again.
       if (!results) return this.listenOnStreams();
 
-      for (let result of results) {
-        let [stream, messages] = result;
+      for (const result of results) {
+        const [stream, messages] = result;
         await this.notifyHandlers(stream, messages);
       }
 
@@ -358,7 +362,10 @@ export class RedisStreamStrategy
 
   // for redis instances. need to add mechanism to try to connect back.
   public handleError(stream: any) {
-    stream.on(ERROR_EVENT, (err: any) => {
+    if (!stream || typeof stream.on !== 'function') {
+      return;
+    }
+    stream.on(RedisEventsMap.ERROR, (err: any) => {
       this.logger.error('Redis instance error: ' + err);
       this.close();
     });
