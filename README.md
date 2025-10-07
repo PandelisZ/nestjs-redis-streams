@@ -1,4 +1,4 @@
-# @tamimaj/nestjs-redis-streams
+# @pandelis/nestjs-redis-streams
 
 Note about this fork
 - This repository is a maintained fork of https://github.com/tamimaj/nestjs-redis-streams. Full credit to @tamimaj (Tamim Abbas Aljuratli) for the original implementation and design.
@@ -380,3 +380,4 @@ MIT
 ## Co-author
 
 <a href="https://github.com/Ali-Meh" >Ali Mahdavi</a>
+<a href="https://github.com/pandelisz" >Pandelis Zembashis</a>
