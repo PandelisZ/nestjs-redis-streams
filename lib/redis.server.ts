@@ -8,7 +8,9 @@ import {
 } from './interfaces';
 
 import { createRedisConnection } from './redis.utils';
-import { CONNECT_EVENT, ERROR_EVENT } from '@nestjs/microservices/constants';
+// ioredis event names used internally
+const CONNECT_EVENT = 'connect';
+const ERROR_EVENT = 'error';
 import { deserialize, serialize } from './streams.utils';
 import { RedisStreamContext } from './stream.context';
 import { Observable } from 'rxjs';
@@ -26,6 +28,23 @@ export class RedisStreamStrategy
 
   constructor(private readonly options: ConstructorOptions) {
     super();
+  }
+
+  // Implement abstract methods required by NestJS Server in v11+
+  public on<EventKey extends keyof Record<string, Function> = keyof Record<string, Function>, EventCallback extends Record<string, Function>[EventKey] = Record<string, Function>[EventKey]>(
+    event: EventKey,
+    callback: EventCallback,
+  ): any {
+    // Delegate to the underlying redis instance if available
+    if (this.redis && typeof (this.redis as any).on === 'function') {
+      (this.redis as any).on(event as any, callback as any);
+    }
+    return undefined;
+  }
+
+  public unwrap<T>(): T {
+    // Expose the underlying server/broker instance (redis)
+    return (this.redis as unknown) as T;
   }
 
   public listen(callback: () => void) {

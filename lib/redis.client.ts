@@ -1,6 +1,8 @@
 import { ClientProxy, ReadPacket, WritePacket } from '@nestjs/microservices';
 import { Injectable, Logger } from '@nestjs/common';
-import { CONNECT_EVENT, ERROR_EVENT } from '@nestjs/microservices/constants';
+// ioredis event names used internally
+const CONNECT_EVENT = 'connect';
+const ERROR_EVENT = 'error';
 import { ClientConstructorOptions, RedisInstance } from './interfaces';
 import { createRedisConnection } from './redis.utils';
 import { RequestsMap } from './requests-map';
@@ -29,6 +31,11 @@ export class RedisStreamClient extends ClientProxy {
     this.requestsMap = new RequestsMap();
     this.streamsToListenOn = this.options?.responseStreams ?? [];
     this.connectServerInstance();
+  }
+
+  // Implement abstract method required by NestJS ClientProxy in v11+
+  public unwrap<T>(): T {
+    return (this.client as unknown) as T;
   }
 
   public async connectServerInstance() {
@@ -106,12 +113,12 @@ export class RedisStreamClient extends ClientProxy {
       if (!this.client) throw new Error('Redis client instance not found.');
 
       const commandArgs: RedisValue[] = [];
-      if(this.options.streams?.maxLen){
-        commandArgs.push("MAXLEN")
-        commandArgs.push("~")
-        commandArgs.push(this.options.streams.maxLen.toString())
+      if (this.options.streams?.maxLen) {
+        commandArgs.push('MAXLEN');
+        commandArgs.push('~');
+        commandArgs.push(this.options.streams.maxLen.toString());
       }
-      commandArgs.push("*")
+      commandArgs.push('*');
       let response = await this.client.xadd(
         stream,
         ...commandArgs,
@@ -312,10 +319,16 @@ export class RedisStreamClient extends ClientProxy {
 
           const { correlationId } = ctx.getMessageHeaders();
 
-          // if no correlationId, could be that this message was not meant for this service.
-          // just ack it.
+          // if no correlationId, could be that this message was not meant for this service,
+          // or the message was fired by this service using the emit method, and not the send method, to fire
+          // and forget. so no callback was provided.
           if (!correlationId) {
             await this.handleAck(ctx);
+
+            this.logger.debug(
+              'No callback found for a message with correlationId: ' +
+                correlationId,
+            );
             return;
           } else {
             await this.deliverToHandler(correlationId, parsedPayload, ctx);
