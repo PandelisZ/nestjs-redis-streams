@@ -1,8 +1,8 @@
 {
-  "name": "@tamimaj/nestjs-redis-streams",
-  "version": "1.3.0",
+  "name": "@pandelis/nestjs-redis-streams",
+  "version": "2.0.0",
   "description": "Redis Streams Transport for NestJS.",
-  "author": "Tamim Abbas Aljuratli <https://tamim.es>",
+  "author": "Pandelis Zembashis <p@ndel.is>",
   "private": false,
   "license": "MIT",
   "main": "dist/index.js",
@@ -19,7 +19,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/tamimaj/nestjs-redis-streams.git"
+    "url": "https://github.com/pandelisz/nestjs-redis-streams.git"
   },
   "keywords": [
     "nest",
@@ -30,12 +30,13 @@
     "redis streams strategy",
     "redis streams transport",
     "nest redis streams strategy",
-    "nest redis streams transport"
+    "nest redis streams transport",
+    "nest microservice redis"
   ],
   "bugs": {
-    "url": "https://github.com/tamimaj/nestjs-redis-streams/issues"
+    "url": "https://github.com/pandelisz/nestjs-redis-streams/issues"
   },
-  "homepage": "https://github.com/tamimaj/nestjs-redis-streams#readme",
+  "homepage": "https://github.com/pandelisz/nestjs-redis-streams#readme",
   "dependencies": {
     "@nestjs/common": "^11.1.6",
     "@nestjs/microservices": "^11.1.6",
