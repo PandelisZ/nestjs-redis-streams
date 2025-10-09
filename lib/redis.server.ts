@@ -54,8 +54,10 @@ export class RedisStreamStrategy
       this.redis.on(RedisEventsMap.CONNECT, () => {
         this.logger.log(
           'Redis connected successfully on ' +
-          (this.options.connection?.url ??
-            this.options.connection?.host + ':' + this.options.connection?.port),
+            (this.options.connection?.url ??
+              this.options.connection?.host +
+                ':' +
+                this.options.connection?.port),
         );
 
         // best-effort, any error will be logged in bindHandlers
@@ -76,7 +78,7 @@ export class RedisStreamStrategy
         }),
       );
 
-      this.listenOnStreams();
+      this.startConsumption();
     } catch (error) {
       this.logger.error(error);
       throw error;
@@ -114,7 +116,10 @@ export class RedisStreamStrategy
       // if group exist for this stream. log debug.
       if (error instanceof Error && error.message.includes('BUSYGROUP')) {
         this.logger.debug?.(
-          'Consumer Group "' + consumerGroup + '" already exists for stream: ' + this.prependPrefix(stream),
+          'Consumer Group "' +
+            consumerGroup +
+            '" already exists for stream: ' +
+            this.prependPrefix(stream),
         );
         return true;
       } else {
@@ -310,12 +315,104 @@ export class RedisStreamStrategy
     }
   }
 
-  private async listenOnStreams(): Promise<void> {
+  /**
+   * Resolve XREADGROUP COUNT for a specific stream based on user-provided patterns.
+   * Returns null if no per-stream concurrency is configured.
+   */
+  private resolveStreamCount(stream: string): number | null {
+    const rules = this.options?.streams?.perStreamConcurrency;
+    if (!Array.isArray(rules) || rules.length === 0) {
+      return null;
+    }
+    for (const rule of rules) {
+      try {
+        const re = new RegExp(rule.pattern);
+        if (re.test(stream)) {
+          const n = Number(rule.count);
+          if (Number.isFinite(n) && n > 0) {
+            return n;
+          }
+        }
+      } catch {
+        // ignore invalid regex
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Dedicated listener loop for a single stream using COUNT for per-stream concurrency control.
+   */
+  private async listenOnSingleStream(stream: string, count: number): Promise<void> {
     try {
       if (!this.redis) throw new Error('Redis instance not found.');
       if (this.isShuttingDown) return;
 
-      const streams = Object.keys(this.streamHandlerMap);
+      const results: any[] = await this.redis.xreadgroup(
+        'GROUP',
+        this.options?.streams?.consumerGroup || '',
+        this.options?.streams?.consumer || '',
+        'COUNT',
+        count,
+        'BLOCK',
+        this.options?.streams?.block || 0,
+        'STREAMS',
+        stream,
+        '>',
+      );
+
+      if (this.isShuttingDown) return;
+
+      // if BLOCK time ended, and results are null, listen again.
+      if (!results) return this.listenOnSingleStream(stream, count);
+
+      for (const result of results) {
+        const [resStream, messages] = result;
+        await this.notifyHandlers(resStream, messages);
+      }
+
+      return this.listenOnSingleStream(stream, count);
+    } catch (error) {
+      this.logger.error(error);
+    }
+  }
+
+  /**
+   * Start consumption loops:
+   * - For streams with a configured COUNT (via perStreamConcurrency), start a dedicated loop per stream.
+   * - For the rest, keep the shared loop without COUNT (backwards compatible).
+   */
+  private startConsumption() {
+    const streams = Object.keys(this.streamHandlerMap);
+    const withCount: Array<{ stream: string; count: number }> = [];
+    const withoutCount: string[] = [];
+
+    for (const s of streams) {
+      const c = this.resolveStreamCount(s);
+      if (c && c > 0) {
+        withCount.push({ stream: s, count: c });
+      } else {
+        withoutCount.push(s);
+      }
+    }
+
+    // Start dedicated loops for streams with per-stream COUNT
+    for (const { stream, count } of withCount) {
+      void this.listenOnSingleStream(stream, count);
+    }
+
+    // Start shared loop for remaining streams (if any)
+    if (withoutCount.length > 0) {
+      void this.listenOnStreamsShared(withoutCount);
+    }
+  }
+
+  // Shared loop for multiple streams (legacy behaviour), no COUNT.
+  private async listenOnStreamsShared(streams: string[]): Promise<void> {
+    try {
+      if (!this.redis) throw new Error('Redis instance not found.');
+      if (this.isShuttingDown) return;
+
       const results: any[] = await this.redis.xreadgroup(
         'GROUP',
         this.options?.streams?.consumerGroup || '',
@@ -330,14 +427,14 @@ export class RedisStreamStrategy
       if (this.isShuttingDown) return;
 
       // if BLOCK time ended, and results are null, listen again.
-      if (!results) return this.listenOnStreams();
+      if (!results) return this.listenOnStreamsShared(streams);
 
       for (const result of results) {
         const [stream, messages] = result;
         await this.notifyHandlers(stream, messages);
       }
 
-      return this.listenOnStreams();
+      return this.listenOnStreamsShared(streams);
     } catch (error) {
       this.logger.error(error);
     }
@@ -405,7 +502,6 @@ export class RedisStreamStrategy
     this.isShuttingDown = true;
 
     try {
-
       if (this.options?.shutdown?.deregisterConsumer !== false) {
         this.logger.log('Deregistering consumer group');
         await this.deregisterConsumer();

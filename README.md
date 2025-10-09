@@ -56,6 +56,7 @@ Status
 
 - Graceful shutdown and drain support:
   - Stop consuming on SIGINT/SIGTERM (or custom signals), optionally deregister the consumer (XGROUP DELCONSUMER), wait for in-flight jobs to finish (with optional timeout), then close Redis connections cleanly.
+- Per-stream concurrency (COUNT) control with regex patterns.
 
 <br>
 <br>
@@ -107,6 +108,12 @@ async function bootstrap() {
       consumer: 'users-1',
       consumerGroup: 'users',
       deleteMessagesAfterAck: true,  // optional: delete message from stream
+      // Optional: per-stream COUNT control using regex-like patterns
+      perStreamConcurrency: [
+        { pattern: 'user.*', count: 10 },              // e.g. match "user.signup", "user.login"
+        { pattern: '^orders:(created|updated)
+, count: 5 },
+      ],
     },
     // optional. See our example main.ts file for more details...
     // serialization: {},
@@ -142,6 +149,8 @@ new RedisStreamStrategy({
     block: 5000,
     consumer: 'users-1',
     consumerGroup: 'users',
+    // Optional per-stream COUNT control
+    perStreamConcurrency: [{ pattern: 'user.*', count: 10 }],
   },
   shutdown: {
     // Which OS signals trigger drain+shutdown:

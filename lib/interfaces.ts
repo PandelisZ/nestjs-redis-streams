@@ -15,6 +15,16 @@ interface RedisStreamOptionsXreadGroup {
   consumerGroup: string;
   consumer: string;
   deleteMessagesAfterAck?: boolean;
+  /**
+   * Configure per-stream concurrency (COUNT for XREADGROUP) using regex-like patterns.
+   * Example:
+   *   perStreamConcurrency: [
+   *     { pattern: 'user.*', count: 10 },
+   *     { pattern: '^orders:(created|updated)
+, count: 5 },
+   *   ]
+   */
+  perStreamConcurrency?: Array<{ pattern: string; count: number }>;
 }
 
 interface RedisStreamOptionsXadd {
