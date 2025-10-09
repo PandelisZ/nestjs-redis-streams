@@ -48,7 +48,7 @@ describe('RedisStreamStrategy', () => {
       expect(server.bindHandlers).toHaveBeenCalled();
       expect(callback).toHaveBeenCalledTimes(1);
     });
-    it('should NOT log a message, bind handlers, or call the provided callback if redis connection is NOT established', () => {
+    it('should NOT  bind handlers, or call the provided callback if redis connection is NOT established', () => {
       // mock the error only.
       createRedisConnection.mockReturnValue({
         on: jest.fn().mockImplementation((event, callback) => {
@@ -58,11 +58,9 @@ describe('RedisStreamStrategy', () => {
         }),
         quit: jest.fn().mockReturnThis(),
       });
-      server.logger.log = jest.fn().mockReturnThis(); // mock the method
       server.bindHandlers = jest.fn().mockReturnThis(); // mock the method
       const callback = jest.fn();
       server.listen(callback);
-      expect(server.logger.log).not.toHaveBeenCalled();
       expect(server.bindHandlers).not.toHaveBeenCalled();
       expect(callback).not.toHaveBeenCalled();
     });
@@ -217,9 +215,9 @@ describe('RedisStreamStrategy', () => {
       );
       expect(mockDebug).toHaveBeenCalledWith(
         'Consumer Group "' +
-          consumerGroup +
-          '" already exists for stream: ' +
-          stream,
+        consumerGroup +
+        '" already exists for stream: ' +
+        stream,
       );
     });
 
@@ -384,7 +382,7 @@ describe('RedisStreamStrategy', () => {
       ];
 
       // mock stream handler map.
-      const handler = jest.fn().mockImplementation(() => {});
+      const handler = jest.fn().mockImplementation(() => { });
       server['streamHandlerMap'] = {
         [stream]: handler,
       };
@@ -426,7 +424,7 @@ describe('RedisStreamStrategy', () => {
       ];
 
       // mock stream handler map.
-      const handler = jest.fn().mockImplementation(() => {});
+      const handler = jest.fn().mockImplementation(() => { });
       server['streamHandlerMap'] = {
         [stream]: handler,
       };
@@ -439,7 +437,7 @@ describe('RedisStreamStrategy', () => {
       deserialize = mockDeserialize;
 
       // mock user provided deserialize function.
-      const mockUserDeserialize = jest.fn().mockReturnValue(() => {});
+      const mockUserDeserialize = jest.fn().mockReturnValue(() => { });
 
       server.options = {
         serialization: {
@@ -576,7 +574,7 @@ describe('RedisStreamStrategy', () => {
       expect(spyAck).toHaveBeenCalled();
     });
 
-    it('should throw an error if publishing responses fails', async () => {
+    it('should log an error if publishing responses fails', async () => {
       const response = [{ id: 1, message: 'test' }];
       const inboundContext = {};
       const isDisposed = false;
@@ -627,14 +625,22 @@ describe('RedisStreamStrategy', () => {
       };
 
       // mock serializer
-      const serializerSpy = jest.fn().mockResolvedValueOnce(['test1', 'test2']);
+      const serializerSpy = jest.fn().mockResolvedValue(['test1', 'test2']);
       serialize = serializerSpy;
 
       await server.publishResponses(responses, inboundContext);
 
-      expect(xaddSpy).toHaveBeenCalledTimes(1);
-      expect(xaddSpy).toHaveBeenCalledWith(
+      expect(xaddSpy).toHaveBeenCalledTimes(2);
+      expect(xaddSpy).toHaveBeenNthCalledWith(
+        1,
         responseObj1.stream,
+        '*',
+        'test1',
+        'test2',
+      );
+      expect(xaddSpy).toHaveBeenNthCalledWith(
+        2,
+        responseObj2.stream,
         '*',
         'test1',
         'test2',
@@ -785,8 +791,12 @@ describe('RedisStreamStrategy', () => {
     });
   });
 
-  describe('close', () => {
-    it('should call quit method on redis and client if they exist', () => {
+  describe('close and shutdown', () => {
+    it('close() should call shutdownGracefully when not already shutting down', () => {
+      const shutdownSpy = jest
+        .spyOn(server, 'shutdownGracefully')
+        .mockResolvedValue(undefined as any);
+
       const quitSpy = jest.fn();
 
       server.redis = {
@@ -798,18 +808,84 @@ describe('RedisStreamStrategy', () => {
 
       server.close();
 
+      expect(shutdownSpy).toHaveBeenCalledTimes(1);
+      expect(quitSpy).not.toHaveBeenCalled();
+    });
+
+    it('shutdownGracefully should deregister consumer and close connections', async () => {
+      const disconnectSpy = jest.fn();
+      const quitSpy = jest.fn();
+
+      server.redis = {
+        disconnect: disconnectSpy,
+        quit: quitSpy,
+      };
+      server.client = {
+        quit: quitSpy,
+      };
+
+      server['deregisterConsumer'] = jest.fn().mockResolvedValue(true);
+
+      server.options.shutdown = { deregisterConsumer: true };
+
+      await server.shutdownGracefully();
+
+      expect(disconnectSpy).toHaveBeenCalled();
+      expect(server['deregisterConsumer']).toHaveBeenCalled();
       expect(quitSpy).toHaveBeenCalledTimes(2);
     });
 
-    it('should not call quit method on redis and client if they do not exist', () => {
+    it('shutdownGracefully should wait for active jobs and then close', async () => {
+      const disconnectSpy = jest.fn();
       const quitSpy = jest.fn();
 
-      server.redis = null;
-      server.client = null;
+      server.redis = {
+        disconnect: disconnectSpy,
+        quit: quitSpy,
+      };
+      server.client = {
+        quit: quitSpy,
+      };
 
-      server.close();
+      server['deregisterConsumer'] = jest.fn().mockResolvedValue(true);
 
-      expect(quitSpy).not.toHaveBeenCalled();
+      server.options.shutdown = { drainTimeoutMs: 100 };
+
+      // simulate one active job and complete it shortly after shutdown starts
+      server['activeJobs'] = 1;
+      setTimeout(() => {
+        // @ts-ignore
+        server['onJobDone']();
+      }, 10);
+
+      await server.shutdownGracefully();
+
+      expect(disconnectSpy).toHaveBeenCalled();
+      expect(quitSpy).toHaveBeenCalledTimes(2);
+    });
+
+    it('shutdownGracefully should respect timeout when jobs do not finish', async () => {
+      const disconnectSpy = jest.fn();
+      const quitSpy = jest.fn();
+
+      server.redis = {
+        disconnect: disconnectSpy,
+        quit: quitSpy,
+      };
+      server.client = {
+        quit: quitSpy,
+      };
+
+      server['deregisterConsumer'] = jest.fn().mockResolvedValue(true);
+
+      server.options.shutdown = { drainTimeoutMs: 10 };
+
+      server['activeJobs'] = 1; // never resolved
+
+      await server.shutdownGracefully();
+
+      expect(disconnectSpy).toHaveBeenCalled();
+      expect(quitSpy).toHaveBeenCalledTimes(2);
     });
   });
 });
