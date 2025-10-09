@@ -38,10 +38,18 @@ export interface Serialization {
   ) => string[] | Promise<string[]>;
 }
 
+export interface GracefulShutdownOptions {
+  signals?: NodeJS.Signals[];
+  drainTimeoutMs?: number;
+  deregisterConsumer?: boolean;
+  exitProcess?: boolean;
+}
+
 export interface ConstructorOptions {
   connection?: RedisConnectionOptions;
   streams: RedisStreamOptions;
   serialization?: Serialization;
+  shutdown?: GracefulShutdownOptions;
 }
 
 export interface ClientConstructorOptions extends ConstructorOptions {

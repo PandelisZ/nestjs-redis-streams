@@ -3,44 +3,41 @@ import { RedisEventsMap } from '@nestjs/microservices/events/redis.events';
 import {
   ConstructorOptions,
   RedisInstance,
-  RedisStreamPattern,
   StreamResponse,
   StreamResponseObject,
 } from './interfaces';
-
 import { createRedisConnection } from './redis.utils';
-// ioredis event names used internally
 import { deserialize, serialize } from './streams.utils';
 import { RedisStreamContext } from './stream.context';
 import { RedisValue } from 'ioredis';
+import { Logger } from '@nestjs/common';
 
 export class RedisStreamStrategy
   extends Server
   implements CustomTransportStrategy {
-  private streamHandlerMap: { [key: string]: any } = {};
+  // Exposed for tests
+  public streamHandlerMap: { [key: string]: any } = {};
 
-  private redis: RedisInstance | null = null;
+  logger = new Logger(RedisStreamStrategy.name);
+  public redis: RedisInstance | null = null;
+  public client: RedisInstance | null = null;
 
-  private client: RedisInstance | null = null;
+  private isShuttingDown = false;
+  private activeJobs = 0;
+  private shutdownPromise: Promise<void> | null = null;
+  private shutdownResolve: (() => void) | null = null;
+  private signalHandlers = new Map<NodeJS.Signals, (...args: any[]) => void>();
 
-  constructor(private readonly options: ConstructorOptions) {
+  constructor(public readonly options: ConstructorOptions) {
     super();
   }
 
-  // Implement abstract methods required by NestJS Server in v11+
-  public on<EventKey extends keyof Record<string, Function> = keyof Record<string, Function>, EventCallback extends Record<string, Function>[EventKey] = Record<string, Function>[EventKey]>(
-    event: EventKey,
-    callback: EventCallback,
-  ): any {
-    // Delegate to the underlying redis instance if available
-    if (this.redis && typeof (this.redis as any).on === 'function') {
-      (this.redis as any).on(event as any, callback as any);
-    }
-    return undefined;
+  // Implement abstract method required by NestJS Server in v11+
+  public on(): any {
+    throw new Error('Method not implemented.');
   }
 
   public unwrap<T>(): T {
-    // Expose the underlying server/broker instance (redis)
     return (this.redis as unknown) as T;
   }
 
@@ -52,22 +49,22 @@ export class RedisStreamStrategy
     this.handleError(this.redis);
     this.handleError(this.client);
 
-    // when server instance connect, bind handlers.
-    this.redis.on(RedisEventsMap.CONNECT, () => {
-      this.logger.log(
-        'Redis connected successfully on ' +
-        (this.options.connection?.url ??
-          this.options.connection?.host +
-          ':' +
-          this.options.connection?.port),
-      );
+    // when server instance connects, bind handlers.
+    if (this.redis && typeof (this.redis as any).on === 'function') {
+      this.redis.on(RedisEventsMap.CONNECT, () => {
+        this.logger.log(
+          'Redis connected successfully on ' +
+          (this.options.connection?.url ??
+            this.options.connection?.host + ':' + this.options.connection?.port),
+        );
 
-      this.bindHandlers();
+        // best-effort, any error will be logged in bindHandlers
+        void this.bindHandlers();
 
-      // Essential. or await app.listen() will hang forever.
-      // Any code after it won't work.
-      callback();
-    });
+        // Essential. or await app.listen() will hang forever.
+        callback();
+      });
+    }
   }
 
   public async bindHandlers() {
@@ -92,13 +89,14 @@ export class RedisStreamStrategy
 
       await this.createConsumerGroup(
         pattern,
-        this.options?.streams?.consumerGroup,
+        this.options?.streams?.consumerGroup as string,
       );
 
       return true;
     } catch (error) {
-      // JSON.parse will throw error, if is not parsable.
-      this.logger.debug!(error + '. Handler Pattern is: ' + pattern);
+      this.logger.debug?.(
+        (error as any) + '. Handler Pattern is: ' + pattern,
+      );
       return false;
     }
   }
@@ -107,25 +105,16 @@ export class RedisStreamStrategy
     try {
       if (!this.redis) throw new Error('Redis instance not found.');
 
-      const modifiedStreamKey = this.prependPrefix(stream);
+      const streamKey = this.prependPrefix(stream);
 
-      await this.redis.xgroup(
-        'CREATE',
-        modifiedStreamKey,
-        consumerGroup,
-        '$',
-        'MKSTREAM',
-      );
+      await this.redis.xgroup('CREATE', streamKey, consumerGroup, '$', 'MKSTREAM');
 
       return true;
     } catch (error) {
       // if group exist for this stream. log debug.
       if (error instanceof Error && error.message.includes('BUSYGROUP')) {
-        this.logger.debug!(
-          'Consumer Group "' +
-          consumerGroup +
-          '" already exists for stream: ' +
-          this.prependPrefix(stream),
+        this.logger.debug?.(
+          'Consumer Group "' + consumerGroup + '" already exists for stream: ' + this.prependPrefix(stream),
         );
         return true;
       } else {
@@ -161,11 +150,11 @@ export class RedisStreamStrategy
 
           const commandArgs: RedisValue[] = [];
           if (this.options.streams?.maxLen) {
-            commandArgs.push("MAXLEN")
-            commandArgs.push("~")
-            commandArgs.push(this.options.streams.maxLen.toString())
+            commandArgs.push('MAXLEN');
+            commandArgs.push('~');
+            commandArgs.push(this.options.streams.maxLen.toString());
           }
-          commandArgs.push("*")
+          commandArgs.push('*');
 
           await this.client.xadd(
             responseObj.stream,
@@ -213,7 +202,7 @@ export class RedisStreamStrategy
   }: {
     response: StreamResponse;
     inboundContext: RedisStreamContext;
-    isDisposed: boolean;
+    isDisposed?: boolean;
   }) {
     try {
       // if response is null or undefined, do not ACK, neither publish anything.
@@ -233,13 +222,34 @@ export class RedisStreamStrategy
         );
 
         if (!publishedResponses) {
-          throw new Error('Could not Xadd response streams.');
+          // Log the error and do not ACK since publishing failed
+          this.logger.error(new Error('Could not Xadd response streams.'));
+          return;
         }
 
         await this.handleAck(inboundContext);
       }
     } catch (error) {
       this.logger.error(error);
+    } finally {
+      if (isDisposed) {
+        this.onJobDone();
+      }
+    }
+  }
+
+  private onJobStart() {
+    this.activeJobs++;
+  }
+
+  private onJobDone() {
+    if (this.activeJobs > 0) {
+      this.activeJobs--;
+    }
+    if (this.isShuttingDown && this.activeJobs === 0 && this.shutdownResolve) {
+      this.shutdownResolve();
+      this.shutdownResolve = null;
+      this.shutdownPromise = null;
     }
   }
 
@@ -250,11 +260,13 @@ export class RedisStreamStrategy
 
       await Promise.all(
         messages.map(async (message) => {
+          this.onJobStart();
+
           const ctx = new RedisStreamContext([
             modifiedStream,
             message[0], // message id needed for ACK.
-            this.options?.streams?.consumerGroup,
-            this.options?.streams?.consumer,
+            this.options?.streams?.consumerGroup as string,
+            this.options?.streams?.consumer as string,
           ]);
 
           let parsedPayload: any;
@@ -269,19 +281,18 @@ export class RedisStreamStrategy
             parsedPayload = await deserialize(message, ctx);
           }
 
-          // the staging function, should attach the inbound context to keep track of
-          //  the message id for ACK, group name, stream name, etc.
-          const stageRespondBack = (responseObj: any) => {
-            responseObj.inboundContext = ctx;
-            this.handleRespondBack(responseObj);
+          const stageRespondBack = (response: any, isDisposed?: boolean) => {
+            this.handleRespondBack({
+              response,
+              inboundContext: ctx,
+              isDisposed: typeof isDisposed === 'boolean' ? isDisposed : true,
+            });
           };
 
           const response$ = this.transformToObservable(
             await handler(parsedPayload, ctx),
           ) as any;
 
-          // Only call send if we received a valid observable (has pipe),
-          // or if send has been overridden on the instance (e.g., in tests).
           const shouldCallSend =
             !!response$ &&
             (typeof response$?.pipe === 'function' ||
@@ -289,6 +300,8 @@ export class RedisStreamStrategy
 
           if (shouldCallSend) {
             this.send(response$, stageRespondBack as any);
+          } else {
+            this.onJobDone();
           }
         }),
       );
@@ -300,7 +313,9 @@ export class RedisStreamStrategy
   private async listenOnStreams(): Promise<void> {
     try {
       if (!this.redis) throw new Error('Redis instance not found.');
+      if (this.isShuttingDown) return;
 
+      const streams = Object.keys(this.streamHandlerMap);
       const results: any[] = await this.redis.xreadgroup(
         'GROUP',
         this.options?.streams?.consumerGroup || '',
@@ -308,15 +323,11 @@ export class RedisStreamStrategy
         'BLOCK',
         this.options?.streams?.block || 0,
         'STREAMS',
-        ...(Object.keys(this.streamHandlerMap).map((s) =>
-          this.stripPrefix(s),
-        ) as string[]), // streams keys
-        ...(
-          Object.keys(this.streamHandlerMap).map((s) =>
-            this.stripPrefix(s),
-          ) as string[]
-        ).map((stream: string) => '>'), // '>', this is needed for xreadgroup as id.
+        ...streams,
+        ...streams.map(() => '>'),
       );
+
+      if (this.isShuttingDown) return;
 
       // if BLOCK time ended, and results are null, listen again.
       if (!results) return this.listenOnStreams();
@@ -328,12 +339,13 @@ export class RedisStreamStrategy
 
       return this.listenOnStreams();
     } catch (error) {
-      console.log('Error in listenOnStreams: ', error);
       this.logger.error(error);
     }
   }
 
-  // When the stream handler name is stored in streamHandlerMap, its stored WITH the key prefix, so sending additional redis commands when using the prefix with the existing key will cause a duplicate prefix. This ensures to strip the first occurrence of the prefix when binding listeners.
+  // When the stream handler name is stored in streamHandlerMap, it's stored WITH the key prefix,
+  // so sending additional redis commands when using the prefix with the existing key will cause a duplicate prefix.
+  // This ensures to strip the first occurrence of the prefix when binding listeners.
   private stripPrefix(streamHandlerName: string) {
     const keyPrefix = this?.redis?.options?.keyPrefix;
     if (!keyPrefix || !streamHandlerName.startsWith(keyPrefix)) {
@@ -343,7 +355,8 @@ export class RedisStreamStrategy
     return streamHandlerName.replace(keyPrefix, '');
   }
 
-  // xgroup CREATE command with ioredis does not automatically prefix the keyPrefix, though many other commands do, such as xreadgroup.
+  // xgroup CREATE command with ioredis does not automatically prefix the keyPrefix,
+  // though many other commands do, such as xreadgroup.
   // https://github.com/redis/ioredis/issues/1659
   private prependPrefix(key: string) {
     const keyPrefix = this?.redis?.options?.keyPrefix;
@@ -354,7 +367,86 @@ export class RedisStreamStrategy
     }
   }
 
-  // for redis instances. need to add mechanism to try to connect back.
+  private async deregisterConsumer() {
+    try {
+      if (!this.client) return;
+
+      const consumerGroup = this.options?.streams?.consumerGroup as string;
+      const consumer = this.options?.streams?.consumer as string;
+
+      const streams = Object.keys(this.streamHandlerMap).map((s) =>
+        this.prependPrefix(this.stripPrefix(s)),
+      );
+
+      await Promise.all(
+        streams.map((stream) =>
+          this.client!.xgroup('DELCONSUMER', stream, consumerGroup, consumer),
+        ),
+      );
+    } catch (error) {
+      this.logger.error(error);
+    }
+  }
+
+  private cleanupSignalHandlers() {
+    for (const [sig, handler] of this.signalHandlers) {
+      try {
+        process.removeListener(sig, handler);
+      } catch {
+        // ignore
+      }
+    }
+    this.signalHandlers.clear();
+  }
+
+  public async shutdownGracefully() {
+    this.logger.log('Shutdown initiated');
+    if (this.isShuttingDown) return;
+    this.isShuttingDown = true;
+
+    try {
+
+      if (this.options?.shutdown?.deregisterConsumer !== false) {
+        this.logger.log('Deregistering consumer group');
+        await this.deregisterConsumer();
+      }
+
+      const timeout = this.options?.shutdown?.drainTimeoutMs;
+      if (this.activeJobs > 0) {
+        if (!this.shutdownPromise) {
+          this.shutdownPromise = new Promise<void>((resolve) => {
+            this.shutdownResolve = resolve;
+          });
+        }
+        if (typeof timeout === 'number' && timeout > 0) {
+          await Promise.race([
+            this.shutdownPromise,
+            new Promise<void>((resolve) => setTimeout(resolve, timeout)),
+          ]);
+        } else {
+          await this.shutdownPromise;
+        }
+      }
+    } finally {
+      this.cleanupSignalHandlers();
+      // Now actually close connections
+      this.redis && this.redis.quit();
+      this.client && this.client.quit();
+
+      if (this.redis) {
+        try {
+          // disconnect to unblock any pending xreadgroup
+          this.redis.disconnect();
+        } catch {
+          // ignore
+        }
+      }
+      if (this.options?.shutdown?.exitProcess) {
+        process.exit(0);
+      }
+    }
+  }
+
   public handleError(stream: any) {
     if (!stream || typeof stream.on !== 'function') {
       return;
@@ -365,9 +457,10 @@ export class RedisStreamStrategy
     });
   }
 
-  public close() {
-    // shut down instances.
-    this.redis && this.redis.quit();
-    this.client && this.client.quit();
+  public async close() {
+    if (!this.isShuttingDown) {
+      await this.shutdownGracefully();
+      return;
+    }
   }
 }

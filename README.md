@@ -54,6 +54,9 @@ Status
 
 - Customizable serialization and deserialization with plug-able functionality.
 
+- Graceful shutdown and drain support:
+  - Stop consuming on SIGINT/SIGTERM (or custom signals), optionally deregister the consumer (XGROUP DELCONSUMER), wait for in-flight jobs to finish (with optional timeout), then close Redis connections cleanly.
+
 <br>
 <br>
 
@@ -89,32 +92,165 @@ import { AppModule } from './app.module';
 import { RedisStreamStrategy } from '@tamimaj/nestjs-redis-streams';
 
 async function bootstrap() {
+  const strategy = new RedisStreamStrategy({
+    // optional. All ioredis options + url.
+    connection: {
+      url: '0.0.0.0:6379',
+      // host: 'localhost',
+      // port: 6379,
+      // password: '123456',
+      // etc...
+    },
+    // mandatory.
+    streams: {
+      block: 5000,
+      consumer: 'users-1',
+      consumerGroup: 'users',
+      deleteMessagesAfterAck: true,  // optional: delete message from stream
+    },
+    // optional. See our example main.ts file for more details...
+    // serialization: {},
+
+    // optional. Graceful shutdown/drain options (see section below)
+    // shutdown: { signals: ['SIGINT', 'SIGTERM'], drainTimeoutMs: 30000, deregisterConsumer: true, exitProcess: false },
+  });
+
   const app = await NestFactory.createMicroservice(AppModule, {
-    strategy: new RedisStreamStrategy({
-      // optional. All ioredis options + url.
-      connection: {
-        url: '0.0.0.0:6379',
-        // host: 'localhost',
-        // port: 6379,
-        // password: '123456',
-        // etc...
-      },
-      // mandatory.
-      streams: {
-        block: 5000,
-        consumer: 'users-1',
-        consumerGroup: 'users',
-        deleteMessagesAfterAck: true,  // optional: delete message from stream
-      },
-      // optional. See our example main.ts file for more details...
-      // serialization: {},
-    }),
+    strategy,
   });
 
   await app.listen();
 }
 bootstrap();
 ```
+
+<br>
+
+### Graceful shutdown and draining
+
+When a shutdown signal is received (default: SIGINT or SIGTERM), the server will:
+- Stop consuming new messages (halts XREADGROUP loop).
+- Deregister this consumer from each stream’s consumer group using XGROUP DELCONSUMER (configurable).
+- Wait for in-flight jobs to finish using an internal active job counter (configurable timeout).
+- Close Redis connections cleanly and optionally exit the process.
+
+Configuration (all fields optional):
+```ts
+new RedisStreamStrategy({
+  connection: { url: 'redis://localhost:6379' },
+  streams: {
+    block: 5000,
+    consumer: 'users-1',
+    consumerGroup: 'users',
+  },
+  shutdown: {
+    // Which OS signals trigger drain+shutdown:
+    signals: ['SIGINT', 'SIGTERM'], // default
+
+    // How long to wait for active jobs to finish before continuing shutdown:
+    // - omit or 0: wait indefinitely until all jobs complete
+    // - number (ms): maximum time to wait
+    drainTimeoutMs: 30000,
+
+    // Deregister this consumer from the consumer group on each stream (XGROUP DELCONSUMER)
+    deregisterConsumer: true, // default
+
+    // Exit the process with code 0 after shutdown completes
+    exitProcess: false, // default
+  },
+});
+```
+
+Notes
+- Draining behavior
+  - The reader connection is disconnected to unblock any pending XREADGROUP call so the loop can exit. The client connection remains available to ACK remaining messages and deregister the consumer.
+  - In-flight jobs are tracked and the server waits until they complete (or until the optional timeout).
+- NestJS lifecycle integration
+  - If you orchestrate microservices from a primary Nest application, you can enable shutdown hooks there so Nest forwards termination signals and calls close() appropriately:
+    ```ts
+    const app = await NestFactory.create(AppModule);
+    app.enableShutdownHooks();
+    // connectMicroservice(...) or app.startAllMicroservices() if applicable
+    await app.listen(3000);
+    ```
+  - This transport also installs its own signal handlers (SIGINT/SIGTERM by default), so it will gracefully drain even when used via createMicroservice() in isolation.
+- Manual drain
+  - If you keep a reference to the strategy instance, you may trigger a programmatic drain:
+    ```ts
+    await strategy.shutdownGracefully(); // stops consumption, waits for in-flight jobs, closes Redis
+    ```
+
+### Using with Nest graceful shutdown
+
+Who calls process.exit?
+- Under a standard Nest application with shutdown hooks enabled, let Nest manage process lifetime. Keep the transport’s shutdown.exitProcess set to false (default). Node will exit naturally after all handles are closed.
+- Only enable shutdown.exitProcess in the transport when you are running the microservice standalone and you want the transport to terminate the process after a clean drain.
+
+Recommended configurations
+
+A) Nest-managed application (recommended)
+- Let Nest capture SIGINT/SIGTERM and orchestrate shutdown. Disable the transport-level signal handlers and keep exitProcess false.
+
+```ts
+import { NestFactory } from '@nestjs/core';
+import { AppModule } from './app.module';
+import { RedisStreamStrategy } from '@tamimaj/nestjs-redis-streams';
+
+async function bootstrap() {
+  const strategy = new RedisStreamStrategy({
+    connection: { url: 'redis://localhost:6379' },
+    streams: { block: 5000, consumer: 'users-1', consumerGroup: 'users' },
+    shutdown: {
+      signals: [],             // disable transport-level signal handlers; Nest will handle signals
+      drainTimeoutMs: 30_000,  // optional
+      deregisterConsumer: true, // default
+      exitProcess: false,       // default
+    },
+  });
+
+  // Hybrid app: main HTTP + microservice. Nest handles signals and will call microservice.close()
+  const app = await NestFactory.create(AppModule);
+  app.enableShutdownHooks();
+  app.connectMicroservice({ strategy });
+  await app.startAllMicroservices();
+  await app.listen(3000);
+}
+
+bootstrap();
+```
+
+B) Standalone microservice (transport-managed signals)
+- Use the transport’s own signal handlers and optionally set exitProcess: true if you want it to call process.exit(0) after shutdown.
+
+```ts
+import { NestFactory } from '@nestjs/core';
+import { AppModule } from './app.module';
+import { RedisStreamStrategy } from '@tamimaj/nestjs-redis-streams';
+
+async function bootstrap() {
+  const strategy = new RedisStreamStrategy({
+    connection: { url: 'redis://localhost:6379' },
+    streams: { block: 5000, consumer: 'users-1', consumerGroup: 'users' },
+    shutdown: {
+      signals: ['SIGINT', 'SIGTERM'], // default
+      drainTimeoutMs: 30_000,
+      deregisterConsumer: true,
+      exitProcess: true,              // transport will exit process after clean drain
+    },
+  });
+
+  const app = await NestFactory.createMicroservice(AppModule, { strategy });
+  await app.listen();
+}
+
+bootstrap();
+```
+
+Caveats
+- Avoid duplicate signal handlers: If both Nest and the transport listen for signals, shutdown will be invoked twice (shutdown is idempotent, but it’s unnecessary). Prefer one owner:
+  - Under Nest: set shutdown.signals: [] on the transport.
+  - Without Nest hooks: keep the transport’s signals enabled (default).
+- Kubernetes/containers: Use SIGTERM with a terminationGracePeriodSeconds longer than your drainTimeoutMs to allow a clean drain.
 
 <br>
 
