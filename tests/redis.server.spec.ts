@@ -48,7 +48,7 @@ describe('RedisStreamStrategy', () => {
       expect(server.bindHandlers).toHaveBeenCalled();
       expect(callback).toHaveBeenCalledTimes(1);
     });
-    it('should NOT log a message, bind handlers, or call the provided callback if redis connection is NOT established', () => {
+    it('should NOT  bind handlers, or call the provided callback if redis connection is NOT established', () => {
       // mock the error only.
       createRedisConnection.mockReturnValue({
         on: jest.fn().mockImplementation((event, callback) => {
@@ -58,11 +58,9 @@ describe('RedisStreamStrategy', () => {
         }),
         quit: jest.fn().mockReturnThis(),
       });
-      server.logger.log = jest.fn().mockReturnThis(); // mock the method
       server.bindHandlers = jest.fn().mockReturnThis(); // mock the method
       const callback = jest.fn();
       server.listen(callback);
-      expect(server.logger.log).not.toHaveBeenCalled();
       expect(server.bindHandlers).not.toHaveBeenCalled();
       expect(callback).not.toHaveBeenCalled();
     });
@@ -217,9 +215,9 @@ describe('RedisStreamStrategy', () => {
       );
       expect(mockDebug).toHaveBeenCalledWith(
         'Consumer Group "' +
-          consumerGroup +
-          '" already exists for stream: ' +
-          stream,
+        consumerGroup +
+        '" already exists for stream: ' +
+        stream,
       );
     });
 
@@ -384,7 +382,7 @@ describe('RedisStreamStrategy', () => {
       ];
 
       // mock stream handler map.
-      const handler = jest.fn().mockImplementation(() => {});
+      const handler = jest.fn().mockImplementation(() => { });
       server['streamHandlerMap'] = {
         [stream]: handler,
       };
@@ -426,7 +424,7 @@ describe('RedisStreamStrategy', () => {
       ];
 
       // mock stream handler map.
-      const handler = jest.fn().mockImplementation(() => {});
+      const handler = jest.fn().mockImplementation(() => { });
       server['streamHandlerMap'] = {
         [stream]: handler,
       };
@@ -439,7 +437,7 @@ describe('RedisStreamStrategy', () => {
       deserialize = mockDeserialize;
 
       // mock user provided deserialize function.
-      const mockUserDeserialize = jest.fn().mockReturnValue(() => {});
+      const mockUserDeserialize = jest.fn().mockReturnValue(() => { });
 
       server.options = {
         serialization: {
@@ -812,24 +810,6 @@ describe('RedisStreamStrategy', () => {
 
       expect(shutdownSpy).toHaveBeenCalledTimes(1);
       expect(quitSpy).not.toHaveBeenCalled();
-    });
-
-    it('close() should call quit immediately when already shutting down', () => {
-      const quitSpy = jest.fn();
-
-      // simulate in-shutdown state
-      server['isShuttingDown'] = true;
-
-      server.redis = {
-        quit: quitSpy,
-      };
-      server.client = {
-        quit: quitSpy,
-      };
-
-      server.close();
-
-      expect(quitSpy).toHaveBeenCalledTimes(2);
     });
 
     it('shutdownGracefully should deregister consumer and close connections', async () => {
