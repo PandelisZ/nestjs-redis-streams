@@ -267,9 +267,8 @@ export class RedisStreamClient extends ClientProxy {
     try {
       if (!this.redis) throw new Error('Redis instance not found.');
 
-      let results: any[];
 
-      results = await this.redis.xreadgroup(
+      const results: any[] = await this.redis.xreadgroup(
         'GROUP',
         this.options?.streams?.consumerGroup || '',
         this.options?.streams?.consumer || '',
@@ -290,12 +289,6 @@ export class RedisStreamClient extends ClientProxy {
 
       return this.listenOnStreams();
     } catch (error) {
-      // Avoid logging noisy framework/mock-specific TypeError seen in tests
-      const e: any = error as any;
-      const msg = String((e && e.message) ? e.message : e);
-      if (e instanceof TypeError && msg.includes('Function.prototype.apply')) {
-        return;
-      }
       this.logger.error(error);
     }
   }
