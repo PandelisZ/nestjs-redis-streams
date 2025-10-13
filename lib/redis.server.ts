@@ -76,6 +76,9 @@ export class RedisStreamStrategy
         }),
       );
 
+      // Cleanup idle consumers (older than BLOCK*2) before starting listeners
+      await this.cleanupIdleConsumersForRegisteredStreams();
+
       this.listenOnStreams();
     } catch (error) {
       this.logger.error(error);
@@ -107,7 +110,349 @@ export class RedisStreamStrategy
 
       const streamKey = this.prependPrefix(stream);
 
-      await this.redis.xgroup('CREATE', streamKey, consumerGroup, '$', 'MKSTREAM');
+      await this.redis.xgroup('CREATE', streamKey, consumerGroup, '
+
+  private async publishResponses(
+    responses: StreamResponseObject[],
+    inboundContext: RedisStreamContext,
+  ) {
+    try {
+      await Promise.all(
+        responses.map(async (responseObj: StreamResponseObject) => {
+          let serializedEntries: string[];
+
+          // if custom serializer is provided.
+          if (typeof this.options?.serialization?.serializer === 'function') {
+            serializedEntries = await this.options.serialization.serializer(
+              responseObj?.payload,
+              inboundContext,
+            );
+          } else {
+            serializedEntries = await serialize(
+              responseObj?.payload,
+              inboundContext,
+            );
+          }
+
+          if (!this.client) throw new Error('Redis client instance not found.');
+
+          const commandArgs: RedisValue[] = [];
+          if (this.options.streams?.maxLen) {
+            commandArgs.push('MAXLEN');
+            commandArgs.push('~');
+            commandArgs.push(this.options.streams.maxLen.toString());
+          }
+          commandArgs.push('*');
+
+          await this.client.xadd(
+            responseObj.stream,
+            ...commandArgs,
+            ...serializedEntries,
+          );
+        }),
+      );
+
+      return true;
+    } catch (error) {
+      this.logger.error(error);
+      return false;
+    }
+  }
+
+  private async handleAck(inboundContext: RedisStreamContext) {
+    try {
+      if (!this.client) throw new Error('Redis client instance not found.');
+
+      await this.client.xack(
+        inboundContext.getStream(),
+        inboundContext.getConsumerGroup(),
+        inboundContext.getMessageId(),
+      );
+
+      if (true === this.options?.streams?.deleteMessagesAfterAck) {
+        await this.client.xdel(
+          inboundContext.getStream(),
+          inboundContext.getMessageId(),
+        );
+      }
+
+      return true;
+    } catch (error) {
+      this.logger.error(error);
+      return false;
+    }
+  }
+
+  private async handleRespondBack({
+    response,
+    inboundContext,
+    isDisposed,
+  }: {
+    response: StreamResponse;
+    inboundContext: RedisStreamContext;
+    isDisposed?: boolean;
+  }) {
+    try {
+      // if response is null or undefined, do not ACK, neither publish anything.
+      if (!response) return;
+
+      // if response is empty array, only ACK.
+      if (Array.isArray(response) && response.length === 0) {
+        await this.handleAck(inboundContext);
+        return;
+      }
+
+      // otherwise, publish response, then Xack.
+      if (Array.isArray(response) && response.length >= 1) {
+        const publishedResponses = await this.publishResponses(
+          response,
+          inboundContext,
+        );
+
+        if (!publishedResponses) {
+          // Log the error and do not ACK since publishing failed
+          this.logger.error(new Error('Could not Xadd response streams.'));
+          return;
+        }
+
+        await this.handleAck(inboundContext);
+      }
+    } catch (error) {
+      this.logger.error(error);
+    } finally {
+      if (isDisposed) {
+        this.onJobDone();
+      }
+    }
+  }
+
+  private onJobStart() {
+    this.activeJobs++;
+  }
+
+  private onJobDone() {
+    if (this.activeJobs > 0) {
+      this.activeJobs--;
+    }
+    if (this.isShuttingDown && this.activeJobs === 0 && this.shutdownResolve) {
+      this.shutdownResolve();
+      this.shutdownResolve = null;
+      this.shutdownPromise = null;
+    }
+  }
+
+  private async notifyHandlers(stream: string, messages: any[]) {
+    try {
+      const modifiedStream = this.stripPrefix(stream);
+      const handler = this.streamHandlerMap[modifiedStream];
+
+      await Promise.all(
+        messages.map(async (message) => {
+          this.onJobStart();
+
+          const ctx = new RedisStreamContext([
+            modifiedStream,
+            message[0], // message id needed for ACK.
+            this.options?.streams?.consumerGroup as string,
+            this.options?.streams?.consumer as string,
+          ]);
+
+          let parsedPayload: any;
+
+          // if custom deserializer is provided.
+          if (typeof this.options?.serialization?.deserializer === 'function') {
+            parsedPayload = await this.options.serialization.deserializer(
+              message,
+              ctx,
+            );
+          } else {
+            parsedPayload = await deserialize(message, ctx);
+          }
+
+          const stageRespondBack = (response: any, isDisposed?: boolean) => {
+            this.handleRespondBack({
+              response,
+              inboundContext: ctx,
+              isDisposed: typeof isDisposed === 'boolean' ? isDisposed : true,
+            });
+          };
+
+          const response$ = this.transformToObservable(
+            await handler(parsedPayload, ctx),
+          ) as any;
+
+          const shouldCallSend =
+            !!response$ &&
+            (typeof response$?.pipe === 'function' ||
+              Object.prototype.hasOwnProperty.call(this, 'send'));
+
+          if (shouldCallSend) {
+            this.send(response$, stageRespondBack as any);
+          } else {
+            this.onJobDone();
+          }
+        }),
+      );
+    } catch (error) {
+      this.logger.error(error);
+    }
+  }
+
+  private async listenOnStreams(): Promise<void> {
+    try {
+      if (!this.redis) throw new Error('Redis instance not found.');
+      if (this.isShuttingDown) return;
+
+      const streams = Object.keys(this.streamHandlerMap);
+      const results: any[] = await this.redis.xreadgroup(
+        'GROUP',
+        this.options?.streams?.consumerGroup || '',
+        this.options?.streams?.consumer || '',
+        'BLOCK',
+        this.options?.streams?.block || 0,
+        'STREAMS',
+        ...streams,
+        ...streams.map(() => '>'),
+      );
+
+      if (this.isShuttingDown) return;
+
+      // if BLOCK time ended, and results are null, listen again.
+      if (!results) return this.listenOnStreams();
+
+      for (const result of results) {
+        const [stream, messages] = result;
+        await this.notifyHandlers(stream, messages);
+      }
+
+      return this.listenOnStreams();
+    } catch (error) {
+      this.logger.error(error);
+    }
+  }
+
+  // When the stream handler name is stored in streamHandlerMap, it's stored WITH the key prefix,
+  // so sending additional redis commands when using the prefix with the existing key will cause a duplicate prefix.
+  // This ensures to strip the first occurrence of the prefix when binding listeners.
+  private stripPrefix(streamHandlerName: string) {
+    const keyPrefix = this?.redis?.options?.keyPrefix;
+    if (!keyPrefix || !streamHandlerName.startsWith(keyPrefix)) {
+      return streamHandlerName;
+    }
+    // Replace just the first instance of the substring
+    return streamHandlerName.replace(keyPrefix, '');
+  }
+
+  // xgroup CREATE command with ioredis does not automatically prefix the keyPrefix,
+  // though many other commands do, such as xreadgroup.
+  // https://github.com/redis/ioredis/issues/1659
+  private prependPrefix(key: string) {
+    const keyPrefix = this?.redis?.options?.keyPrefix;
+    if (keyPrefix && !key.startsWith(keyPrefix)) {
+      return `${keyPrefix}${key}`;
+    } else {
+      return key;
+    }
+  }
+
+  private async deregisterConsumer() {
+    try {
+      if (!this.client) return;
+
+      const consumerGroup = this.options?.streams?.consumerGroup as string;
+      const consumer = this.options?.streams?.consumer as string;
+
+      const streams = Object.keys(this.streamHandlerMap).map((s) =>
+        this.prependPrefix(this.stripPrefix(s)),
+      );
+
+      await Promise.all(
+        streams.map((stream) =>
+          this.client!.xgroup('DELCONSUMER', stream, consumerGroup, consumer),
+        ),
+      );
+    } catch (error) {
+      this.logger.error(error);
+    }
+  }
+
+  private cleanupSignalHandlers() {
+    for (const [sig, handler] of this.signalHandlers) {
+      try {
+        process.removeListener(sig, handler);
+      } catch {
+        // ignore
+      }
+    }
+    this.signalHandlers.clear();
+  }
+
+  public async shutdownGracefully() {
+    this.logger.log('Shutdown initiated');
+    if (this.isShuttingDown) return;
+    this.isShuttingDown = true;
+
+    try {
+
+      if (this.options?.shutdown?.deregisterConsumer !== false) {
+        this.logger.log('Deregistering consumer group');
+        await this.deregisterConsumer();
+      }
+
+      const timeout = this.options?.shutdown?.drainTimeoutMs;
+      if (this.activeJobs > 0) {
+        if (!this.shutdownPromise) {
+          this.shutdownPromise = new Promise<void>((resolve) => {
+            this.shutdownResolve = resolve;
+          });
+        }
+        if (typeof timeout === 'number' && timeout > 0) {
+          await Promise.race([
+            this.shutdownPromise,
+            new Promise<void>((resolve) => setTimeout(resolve, timeout)),
+          ]);
+        } else {
+          await this.shutdownPromise;
+        }
+      }
+    } finally {
+      this.cleanupSignalHandlers();
+      // Now actually close connections
+      this.redis && this.redis.quit();
+      this.client && this.client.quit();
+
+      if (this.redis) {
+        try {
+          // disconnect to unblock any pending xreadgroup
+          this.redis.disconnect();
+        } catch {
+          // ignore
+        }
+      }
+      if (this.options?.shutdown?.exitProcess) {
+        process.exit(0);
+      }
+    }
+  }
+
+  public handleError(stream: any) {
+    if (!stream || typeof stream.on !== 'function') {
+      return;
+    }
+    stream.on(RedisEventsMap.ERROR, (err: any) => {
+      this.logger.error('Redis instance error: ' + err);
+      this.close();
+    });
+  }
+
+  public async close() {
+    if (!this.isShuttingDown) {
+      await this.shutdownGracefully();
+      return;
+    }
+  }
+}
+, 'MKSTREAM');
 
       return true;
     } catch (error) {
@@ -122,6 +467,98 @@ export class RedisStreamStrategy
         return false;
       }
     }
+  }
+
+  private getIdleThresholdMs(): number | null {
+    const block = this.options?.streams?.block;
+    if (typeof block === 'number' && block > 0) {
+      return block * 2;
+    }
+    return null;
+  }
+
+  private async cleanupIdleConsumersForRegisteredStreams() {
+    try {
+      const threshold = this.getIdleThresholdMs();
+      if (!threshold) {
+        // If BLOCK is 0 or not provided, skip cleanup to avoid deleting all consumers.
+        return;
+      }
+
+      const consumerGroup = this.options?.streams?.consumerGroup as string;
+      const streams = Object.keys(this.streamHandlerMap).map((s) =>
+        this.prependPrefix(this.stripPrefix(s)),
+      );
+
+      await Promise.all(
+        streams.map((streamKey) =>
+          this.cleanupIdleConsumers(streamKey, consumerGroup, threshold),
+        ),
+      );
+    } catch (error) {
+      this.logger.error(error);
+    }
+  }
+
+  private async cleanupIdleConsumers(
+    streamKey: string,
+    consumerGroup: string,
+    thresholdMs: number,
+  ) {
+    try {
+      if (!this.redis) throw new Error('Redis instance not found.');
+
+      // Use a generic call to support environments where xinfo may not be typed
+      const consumersInfo: any[] = await (this.redis as any).call(
+        'XINFO',
+        'CONSUMERS',
+        streamKey,
+        consumerGroup,
+      );
+
+      if (!Array.isArray(consumersInfo)) return;
+
+      for (const entry of consumersInfo) {
+        if (!Array.isArray(entry)) continue;
+
+        const info = this.parseKeyValueArray(entry);
+        const name = this.safeToString(info['name']);
+        const idle = Number(info['idle'] ?? 0);
+
+        if (name && idle > thresholdMs) {
+          try {
+            await this.client!.xgroup('DELCONSUMER', streamKey, consumerGroup, name);
+            this.logger.log(
+              `Deleted idle consumer "${name}" on stream "${streamKey}" (idle ${idle}ms > ${thresholdMs}ms).`,
+            );
+          } catch (error) {
+            this.logger.error(error);
+          }
+        }
+      }
+    } catch (error) {
+      this.logger.error(error);
+    }
+  }
+
+  private parseKeyValueArray(arr: any[]): Record<string, any> {
+    const obj: Record<string, any> = {};
+    for (let i = 0; i < arr.length; i += 2) {
+      const key = this.safeToString(arr[i]);
+      let val: any = arr[i + 1];
+      if (val && typeof val === 'object' && typeof (val as any).toString === 'function') {
+        val = (val as any).toString();
+      }
+      obj[key] = val;
+    }
+    return obj;
+  }
+
+  private safeToString(val: any): string {
+    if (typeof val === 'string') return val;
+    if (typeof val === 'number') return String(val);
+    if (val && typeof val.toString === 'function') return val.toString();
+    return '';
   }
 
   private async publishResponses(
