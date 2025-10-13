@@ -109,8 +109,7 @@ export class RedisStreamStrategy
 
       const streamKey = this.prependPrefix(stream);
 
-      await this.redis.xgroup('CREATE', streamKey, consumerGroup, '
-, 'MKSTREAM');
+      await this.redis.xgroup('CREATE', streamKey, consumerGroup, '$', 'MKSTREAM');
 
       return true;
     } catch (error) {
