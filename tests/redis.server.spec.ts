@@ -518,31 +518,17 @@ describe('RedisStreamStrategy', () => {
   });
 
   describe('handleRespondBack', () => {
-    it('should not ACK or publish anything if response is null', async () => {
+    it('should only ACK if response is falsy', async () => {
       const response = null;
       const inboundContext = {};
-      const isDisposed = false;
-      const spyAck = jest.spyOn(server, 'handleAck');
-
-      let result = await server.handleRespondBack({
-        response,
-        inboundContext,
-        isDisposed,
-      });
-
-      expect(spyAck).not.toHaveBeenCalled();
-      expect(result).toBeUndefined();
-    });
-
-    it('should only ACK if response is an empty array', async () => {
-      const response = [];
-      const inboundContext = {};
+      const stream = "stream"
       const isDisposed = false;
       const spyAck = jest.spyOn(server, 'handleAck');
 
       await server.handleRespondBack({
         response,
         inboundContext,
+        stream,
         isDisposed,
       });
 
@@ -554,7 +540,8 @@ describe('RedisStreamStrategy', () => {
         { id: 1, message: 'test' },
         { id: 2, message: 'test2' },
       ];
-      const inboundContext = {};
+      const inboundContext = { getMessageHeaders: () => ({"streamType": "send"}) };
+      const stream = "stream";
       const isDisposed = false;
       const spyAck = jest.spyOn(server, 'handleAck');
       const spyPublishResponses = jest
@@ -564,11 +551,13 @@ describe('RedisStreamStrategy', () => {
       await server.handleRespondBack({
         response,
         inboundContext,
+        stream,
         isDisposed,
       });
 
       expect(spyPublishResponses).toHaveBeenCalledWith(
         response,
+        stream,
         inboundContext,
       );
       expect(spyAck).toHaveBeenCalled();
@@ -576,7 +565,8 @@ describe('RedisStreamStrategy', () => {
 
     it('should log an error if publishing responses fails', async () => {
       const response = [{ id: 1, message: 'test' }];
-      const inboundContext = {};
+      const inboundContext = { getMessageHeaders: () => ({"streamType": "send"}) };
+      const stream = "stream"
       const isDisposed = false;
 
       const spyPublishResponses = jest.fn().mockResolvedValueOnce(false);
@@ -587,10 +577,11 @@ describe('RedisStreamStrategy', () => {
         error: jest.fn(),
       };
 
-      await server.handleRespondBack({ response, inboundContext, isDisposed });
+      await server.handleRespondBack({ response, inboundContext, stream, isDisposed });
 
       expect(spyPublishResponses).toHaveBeenCalledWith(
         response,
+        stream,
         inboundContext,
       );
 
@@ -618,6 +609,7 @@ describe('RedisStreamStrategy', () => {
     it('should publish responses to Redis streams', async () => {
       const responses = [responseObj1, responseObj2];
       const inboundContext = {};
+      const stream = "stream"
 
       const xaddSpy = jest.fn().mockResolvedValue(true);
       server.client = {
@@ -628,19 +620,12 @@ describe('RedisStreamStrategy', () => {
       const serializerSpy = jest.fn().mockResolvedValue(['test1', 'test2']);
       serialize = serializerSpy;
 
-      await server.publishResponses(responses, inboundContext);
+      await server.publishResponses(responses, stream, inboundContext);
 
-      expect(xaddSpy).toHaveBeenCalledTimes(2);
+      expect(xaddSpy).toHaveBeenCalledTimes(1);
       expect(xaddSpy).toHaveBeenNthCalledWith(
         1,
-        responseObj1.stream,
-        '*',
-        'test1',
-        'test2',
-      );
-      expect(xaddSpy).toHaveBeenNthCalledWith(
-        2,
-        responseObj2.stream,
+        stream,
         '*',
         'test1',
         'test2',
@@ -659,10 +644,10 @@ describe('RedisStreamStrategy', () => {
         },
       };
 
-      await server.publishResponses(responses, inboundContext);
+      await server.publishResponses(responses, "", inboundContext);
 
       expect(userSerializerSpy).toHaveBeenCalledWith(
-        responseObj1.payload,
+        responses,
         inboundContext,
       );
     });
