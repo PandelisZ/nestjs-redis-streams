@@ -390,6 +390,7 @@ export class RedisStreamStrategy
 
   // Startup maintenance: delete consumers idle beyond threshold and reclaim their pending jobs
   private async cleanupIdleConsumers() {
+    this.logger.log('CleanupIdleConsumers');
     try {
       // Require both connections and configuration
       if (!this.redis || !this.client) return;
@@ -400,14 +401,7 @@ export class RedisStreamStrategy
       // Only act when block is a positive number
       if (typeof block !== 'number' || block <= 0) return;
 
-      // Guard against clients that do not expose xinfo/xautoclaim in tests/mocks
-      const hasXInfo = typeof (this.redis as any).xinfo === 'function';
-      const hasXGroup = typeof (this.client as any).xgroup === 'function';
-      const hasXAutoClaim = typeof (this.client as any).xautoclaim === 'function';
-
-      if (!hasXInfo || !hasXGroup) return;
-
-      const thresholdMs = block * 2;
+      const thresholdMs = block * 10;
 
       const streams = Object.keys(this.streamHandlerMap).map((s) =>
         this.prependPrefix(this.stripPrefix(s)),
@@ -416,7 +410,7 @@ export class RedisStreamStrategy
       for (const stream of streams) {
         try {
           // 1) Discover idle consumers
-          const consumersRaw: any = await (this.redis as any).xinfo(
+          const consumersRaw = await this.redis.xinfo(
             'CONSUMERS',
             stream,
             consumerGroup,
@@ -425,15 +419,9 @@ export class RedisStreamStrategy
           const consumers = this.parseXInfoConsumers(consumersRaw);
 
           const staleConsumers = consumers.filter((c) => {
-            const name = String((c as any).name ?? '');
-            if (!name || name === myConsumer) return false;
+            if (c.name === myConsumer) return false;
             const idleVal = Number(
-              (c as any).idle ??
-              (c as any).idleTime ??
-              (c as any).idle_ms ??
-              (c as any).idleMS ??
-              (c as any).idleMs ??
-              0,
+              c.idle ?? 0,
             );
             return idleVal > thresholdMs;
           });
@@ -443,35 +431,34 @@ export class RedisStreamStrategy
           }
 
           // 2) Best-effort reclaim of idle pending entries to this consumer
-          if (hasXAutoClaim) {
-            await this.autoClaimIdle(stream, consumerGroup, myConsumer, thresholdMs);
-          }
+          await this.autoClaimIdle(stream, consumerGroup, myConsumer, thresholdMs);
 
           // 3) Delete stale consumers
           for (const sc of staleConsumers) {
             try {
-              await (this.client as any).xgroup(
+              this.logger.log('CleanupIdleConsumers DELCONSUMER: ' + sc.name);
+              await this.client.xgroup(
                 'DELCONSUMER',
                 stream,
                 consumerGroup,
-                String((sc as any).name),
+                sc.name
               );
             } catch (e) {
-              this.logger.debug?.(
+              this.logger.warn?.(
                 `Failed to delete consumer "${String(
-                  (sc as any).name,
+                  sc.name,
                 )}" on ${stream}: ${e}`,
               );
             }
           }
         } catch (e) {
-          this.logger.debug?.(
+          this.logger.warn?.(
             `Idle-consumer cleanup failed for stream ${stream}: ${e}`,
           );
         }
       }
     } catch (error) {
-      this.logger.debug?.(`Idle-consumer cleanup error: ${error}`);
+      this.logger.warn?.(`Idle-consumer cleanup error: ${error}`);
     }
   }
 
@@ -487,11 +474,9 @@ export class RedisStreamStrategy
         for (let i = 0; i < item.length; i += 2) {
           obj[String(item[i])] = item[i + 1];
         }
-        out.push({ name: String(obj['name'] ?? ''), idle: Number(obj['idle'] ?? obj['idleTime'] ?? 0) });
+        out.push({ name: obj['name'], idle: Number(obj['idle']) });
       } else if (typeof item === 'object') {
-        const name = String((item as any).name ?? '');
-        const idle = Number((item as any).idle ?? (item as any).idleTime ?? 0);
-        out.push({ name, idle });
+        out.push({ name: item.name, idle: item.idle });
       }
     }
     return out;
@@ -504,15 +489,14 @@ export class RedisStreamStrategy
     consumer: string,
     minIdleMs: number,
   ) {
+    if (!this.client || typeof this.client.xautoclaim !== 'function') return;
     try {
-      if (!this.client || typeof (this.client as any).xautoclaim !== 'function') return;
-
       let cursor = '0-0';
       let safety = 0;
 
       while (true) {
         // xautoclaim key group consumer min-idle start [COUNT count]
-        const res: any = await (this.client as any).xautoclaim(
+        const res: any = await this.client.xautoclaim(
           stream,
           group,
           consumer,
@@ -541,7 +525,7 @@ export class RedisStreamStrategy
         }
       }
     } catch (e) {
-      this.logger.debug?.(
+      this.logger.warn?.(
         `XAUTOCLAIM failed on stream ${stream}, group ${group}: ${e}`,
       );
     }
