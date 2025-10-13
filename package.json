@@ -1,6 +1,6 @@
 {
   "name": "@pandelis/nestjs-redis-streams",
-  "version": "2.1.1",
+  "version": "2.1.2",
   "description": "Redis Streams Transport for NestJS. A drop in replacement for the built-in microservice Redis transport.",
   "author": "Pandelis Zembashis <p@ndel.is>",
   "private": false,
