@@ -412,6 +412,13 @@ export class RedisStreamClient extends ClientProxy {
         inboundContext.getMessageId(),
       );
 
+      if (true === this.options?.streams?.deleteMessagesAfterAck) {
+        await this.client.xdel(
+          inboundContext.getStream(),
+          inboundContext.getMessageId(),
+        );
+      }
+
       return true;
     } catch (error) {
       this.logger.error(error);
