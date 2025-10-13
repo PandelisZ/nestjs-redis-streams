@@ -1,10 +1,9 @@
-import { Server, CustomTransportStrategy } from '@nestjs/microservices';
+import { Server, CustomTransportStrategy, WritePacket } from '@nestjs/microservices';
 import { RedisEventsMap } from '@nestjs/microservices/events/redis.events';
 import {
   ConstructorOptions,
   RedisInstance,
   StreamResponse,
-  StreamResponseObject,
 } from './interfaces';
 import { createRedisConnection } from './redis.utils';
 import { deserialize, serialize } from './streams.utils';
@@ -125,43 +124,40 @@ export class RedisStreamStrategy
   }
 
   private async publishResponses(
-    responses: StreamResponseObject[],
+    response: any,
+    stream: string,
     inboundContext: RedisStreamContext,
   ) {
     try {
-      await Promise.all(
-        responses.map(async (responseObj: StreamResponseObject) => {
-          let serializedEntries: string[];
+      let serializedEntries: string[];
 
-          // if custom serializer is provided.
-          if (typeof this.options?.serialization?.serializer === 'function') {
-            serializedEntries = await this.options.serialization.serializer(
-              responseObj?.payload,
-              inboundContext,
-            );
-          } else {
-            serializedEntries = await serialize(
-              responseObj?.payload,
-              inboundContext,
-            );
-          }
+      // if custom serializer is provided.
+      if (typeof this.options?.serialization?.serializer === 'function') {
+        serializedEntries = await this.options.serialization.serializer(
+          response,
+          inboundContext,
+        );
+      } else {
+        serializedEntries = await serialize(
+          { data: response },
+          inboundContext,
+        );
+      }
 
-          if (!this.client) throw new Error('Redis client instance not found.');
+      if (!this.client) throw new Error('Redis client instance not found.');
 
-          const commandArgs: RedisValue[] = [];
-          if (this.options.streams?.maxLen) {
-            commandArgs.push('MAXLEN');
-            commandArgs.push('~');
-            commandArgs.push(this.options.streams.maxLen.toString());
-          }
-          commandArgs.push('*');
+      const commandArgs: RedisValue[] = [];
+      if (this.options.streams?.maxLen) {
+        commandArgs.push('MAXLEN');
+        commandArgs.push('~');
+        commandArgs.push(this.options.streams.maxLen.toString());
+      }
+      commandArgs.push('*');
 
-          await this.client.xadd(
-            responseObj.stream,
-            ...commandArgs,
-            ...serializedEntries,
-          );
-        }),
+      await this.client.xadd(
+        stream,
+        ...commandArgs,
+        ...serializedEntries,
       );
 
       return true;
@@ -198,26 +194,26 @@ export class RedisStreamStrategy
   private async handleRespondBack({
     response,
     inboundContext,
+    stream,
     isDisposed,
   }: {
     response: StreamResponse;
     inboundContext: RedisStreamContext;
+    stream: string;
     isDisposed?: boolean;
   }) {
     try {
-      // if response is null or undefined, do not ACK, neither publish anything.
-      if (!response) return;
-
-      // if response is empty array, only ACK.
-      if (Array.isArray(response) && response.length === 0) {
+      // if response is null or undefined, just ACK.
+      if (!response) {
         await this.handleAck(inboundContext);
         return;
       }
 
-      // otherwise, publish response, then Xack.
-      if (Array.isArray(response) && response.length >= 1) {
+      if (inboundContext.getMessageHeaders()["streamType"] === "send") {
+        // otherwise, publish response, then Xack.
         const publishedResponses = await this.publishResponses(
           response,
+          stream,
           inboundContext,
         );
 
@@ -226,9 +222,9 @@ export class RedisStreamStrategy
           this.logger.error(new Error('Could not Xadd response streams.'));
           return;
         }
-
-        await this.handleAck(inboundContext);
       }
+
+      await this.handleAck(inboundContext);
     } catch (error) {
       this.logger.error(error);
     } finally {
@@ -281,11 +277,12 @@ export class RedisStreamStrategy
             parsedPayload = await deserialize(message, ctx);
           }
 
-          const stageRespondBack = (response: any, isDisposed?: boolean) => {
+          const stageRespondBack = (packet: WritePacket) => {
             this.handleRespondBack({
-              response,
+              response: packet.response,
               inboundContext: ctx,
-              isDisposed: typeof isDisposed === 'boolean' ? isDisposed : true,
+              stream: `${stream}:response`,
+              isDisposed: packet.isDisposed,
             });
           };
 
