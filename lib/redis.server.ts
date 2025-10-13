@@ -75,6 +75,9 @@ export class RedisStreamStrategy
         }),
       );
 
+      // best-effort cleanup of stale consumers and reclaim pending jobs before starting to read
+      await this.cleanupIdleConsumers();
+
       this.listenOnStreams();
     } catch (error) {
       this.logger.error(error);
@@ -382,6 +385,149 @@ export class RedisStreamStrategy
       );
     } catch (error) {
       this.logger.error(error);
+    }
+  }
+
+  // Startup maintenance: delete consumers idle beyond threshold and reclaim their pending jobs
+  private async cleanupIdleConsumers() {
+    this.logger.log('CleanupIdleConsumers');
+    try {
+      // Require both connections and configuration
+      if (!this.redis || !this.client) return;
+      const block = this.options?.streams?.block;
+      const consumerGroup = this.options?.streams?.consumerGroup as string;
+      const myConsumer = this.options?.streams?.consumer as string;
+
+      // Only act when block is a positive number
+      if (typeof block !== 'number' || block <= 0) return;
+
+      const thresholdMs = block * 10;
+
+      const streams = Object.keys(this.streamHandlerMap).map((s) =>
+        this.prependPrefix(this.stripPrefix(s)),
+      );
+
+      for (const stream of streams) {
+        try {
+          // 1) Discover idle consumers
+          const consumersRaw = await this.redis.xinfo(
+            'CONSUMERS',
+            stream,
+            consumerGroup,
+          );
+
+          const consumers = this.parseXInfoConsumers(consumersRaw);
+
+          const staleConsumers = consumers.filter((c) => {
+            if (c.name === myConsumer) return false;
+            const idleVal = Number(
+              c.idle ?? 0,
+            );
+            return idleVal > thresholdMs;
+          });
+
+          if (staleConsumers.length === 0) {
+            continue;
+          }
+
+          // 2) Best-effort reclaim of idle pending entries to this consumer
+          await this.autoClaimIdle(stream, consumerGroup, myConsumer, thresholdMs);
+
+          // 3) Delete stale consumers
+          for (const sc of staleConsumers) {
+            try {
+              this.logger.log('CleanupIdleConsumers DELCONSUMER: ' + sc.name);
+              await this.client.xgroup(
+                'DELCONSUMER',
+                stream,
+                consumerGroup,
+                sc.name
+              );
+            } catch (e) {
+              this.logger.warn?.(
+                `Failed to delete consumer "${String(
+                  sc.name,
+                )}" on ${stream}: ${e}`,
+              );
+            }
+          }
+        } catch (e) {
+          this.logger.warn?.(
+            `Idle-consumer cleanup failed for stream ${stream}: ${e}`,
+          );
+        }
+      }
+    } catch (error) {
+      this.logger.warn?.(`Idle-consumer cleanup error: ${error}`);
+    }
+  }
+
+  // Parse XINFO CONSUMERS response into { name, idle } objects
+  private parseXInfoConsumers(consumersRaw: any): Array<{ name: string; idle?: number }> {
+    if (!consumersRaw) return [];
+    const out: Array<{ name: string; idle?: number }> = [];
+    // ioredis may return an array of arrays or array of objects
+    for (const item of consumersRaw as any[]) {
+      if (!item) continue;
+      if (Array.isArray(item)) {
+        const obj: Record<string, any> = {};
+        for (let i = 0; i < item.length; i += 2) {
+          obj[String(item[i])] = item[i + 1];
+        }
+        out.push({ name: obj['name'], idle: Number(obj['idle']) });
+      } else if (typeof item === 'object') {
+        out.push({ name: item.name, idle: item.idle });
+      }
+    }
+    return out;
+  }
+
+  // Reclaim idle pending entries across the group to the current consumer
+  private async autoClaimIdle(
+    stream: string,
+    group: string,
+    consumer: string,
+    minIdleMs: number,
+  ) {
+    if (!this.client || typeof this.client.xautoclaim !== 'function') return;
+    try {
+      let cursor = '0-0';
+      let safety = 0;
+
+      while (true) {
+        // xautoclaim key group consumer min-idle start [COUNT count]
+        const res: any = await this.client.xautoclaim(
+          stream,
+          group,
+          consumer,
+          minIdleMs,
+          cursor,
+          'COUNT',
+          100,
+        );
+
+        // Expected shape: [nextStart, messages]
+        if (!res || !Array.isArray(res) || res.length < 2) {
+          break;
+        }
+
+        cursor = String(res[0] ?? '0-0');
+        const messages = Array.isArray(res[1]) ? res[1] : [];
+
+        // If no messages claimed and cursor didn't advance, we're done
+        if (messages.length === 0 && (cursor === '0-0' || ++safety > 100)) {
+          break;
+        }
+
+        // Continue until cursor wraps to 0-0 (no more)
+        if (cursor === '0-0' && messages.length === 0) {
+          break;
+        }
+      }
+    } catch (e) {
+      this.logger.warn?.(
+        `XAUTOCLAIM failed on stream ${stream}, group ${group}: ${e}`,
+      );
     }
   }
 
