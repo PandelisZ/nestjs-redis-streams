@@ -75,6 +75,9 @@ export class RedisStreamStrategy
         }),
       );
 
+      // best-effort cleanup of stale consumers and reclaim pending jobs before starting to read
+      await this.cleanupIdleConsumers();
+
       this.listenOnStreams();
     } catch (error) {
       this.logger.error(error);
@@ -106,7 +109,8 @@ export class RedisStreamStrategy
 
       const streamKey = this.prependPrefix(stream);
 
-      await this.redis.xgroup('CREATE', streamKey, consumerGroup, '$', 'MKSTREAM');
+      await this.redis.xgroup('CREATE', streamKey, consumerGroup, '
+, 'MKSTREAM');
 
       return true;
     } catch (error) {
@@ -382,6 +386,165 @@ export class RedisStreamStrategy
       );
     } catch (error) {
       this.logger.error(error);
+    }
+  }
+
+  // Startup maintenance: delete consumers idle beyond threshold and reclaim their pending jobs
+  private async cleanupIdleConsumers() {
+    try {
+      // Require both connections and configuration
+      if (!this.redis || !this.client) return;
+      const block = this.options?.streams?.block;
+      const consumerGroup = this.options?.streams?.consumerGroup as string;
+      const myConsumer = this.options?.streams?.consumer as string;
+
+      // Only act when block is a positive number
+      if (typeof block !== 'number' || block <= 0) return;
+
+      // Guard against clients that do not expose xinfo/xautoclaim in tests/mocks
+      const hasXInfo = typeof (this.redis as any).xinfo === 'function';
+      const hasXGroup = typeof (this.client as any).xgroup === 'function';
+      const hasXAutoClaim = typeof (this.client as any).xautoclaim === 'function';
+
+      if (!hasXInfo || !hasXGroup) return;
+
+      const thresholdMs = block * 2;
+
+      const streams = Object.keys(this.streamHandlerMap).map((s) =>
+        this.prependPrefix(this.stripPrefix(s)),
+      );
+
+      for (const stream of streams) {
+        try {
+          // 1) Discover idle consumers
+          const consumersRaw: any = await (this.redis as any).xinfo(
+            'CONSUMERS',
+            stream,
+            consumerGroup,
+          );
+
+          const consumers = this.parseXInfoConsumers(consumersRaw);
+
+          const staleConsumers = consumers.filter((c) => {
+            const name = String((c as any).name ?? '');
+            if (!name || name === myConsumer) return false;
+            const idleVal = Number(
+              (c as any).idle ??
+              (c as any).idleTime ??
+              (c as any).idle_ms ??
+              (c as any).idleMS ??
+              (c as any).idleMs ??
+              0,
+            );
+            return idleVal > thresholdMs;
+          });
+
+          if (staleConsumers.length === 0) {
+            continue;
+          }
+
+          // 2) Best-effort reclaim of idle pending entries to this consumer
+          if (hasXAutoClaim) {
+            await this.autoClaimIdle(stream, consumerGroup, myConsumer, thresholdMs);
+          }
+
+          // 3) Delete stale consumers
+          for (const sc of staleConsumers) {
+            try {
+              await (this.client as any).xgroup(
+                'DELCONSUMER',
+                stream,
+                consumerGroup,
+                String((sc as any).name),
+              );
+            } catch (e) {
+              this.logger.debug?.(
+                `Failed to delete consumer "${String(
+                  (sc as any).name,
+                )}" on ${stream}: ${e}`,
+              );
+            }
+          }
+        } catch (e) {
+          this.logger.debug?.(
+            `Idle-consumer cleanup failed for stream ${stream}: ${e}`,
+          );
+        }
+      }
+    } catch (error) {
+      this.logger.debug?.(`Idle-consumer cleanup error: ${error}`);
+    }
+  }
+
+  // Parse XINFO CONSUMERS response into { name, idle } objects
+  private parseXInfoConsumers(consumersRaw: any): Array<{ name: string; idle?: number }> {
+    if (!consumersRaw) return [];
+    const out: Array<{ name: string; idle?: number }> = [];
+    // ioredis may return an array of arrays or array of objects
+    for (const item of consumersRaw as any[]) {
+      if (!item) continue;
+      if (Array.isArray(item)) {
+        const obj: Record<string, any> = {};
+        for (let i = 0; i < item.length; i += 2) {
+          obj[String(item[i])] = item[i + 1];
+        }
+        out.push({ name: String(obj['name'] ?? ''), idle: Number(obj['idle'] ?? obj['idleTime'] ?? 0) });
+      } else if (typeof item === 'object') {
+        const name = String((item as any).name ?? '');
+        const idle = Number((item as any).idle ?? (item as any).idleTime ?? 0);
+        out.push({ name, idle });
+      }
+    }
+    return out;
+  }
+
+  // Reclaim idle pending entries across the group to the current consumer
+  private async autoClaimIdle(
+    stream: string,
+    group: string,
+    consumer: string,
+    minIdleMs: number,
+  ) {
+    try {
+      if (!this.client || typeof (this.client as any).xautoclaim !== 'function') return;
+
+      let cursor = '0-0';
+      let safety = 0;
+
+      while (true) {
+        // xautoclaim key group consumer min-idle start [COUNT count]
+        const res: any = await (this.client as any).xautoclaim(
+          stream,
+          group,
+          consumer,
+          minIdleMs,
+          cursor,
+          'COUNT',
+          100,
+        );
+
+        // Expected shape: [nextStart, messages]
+        if (!res || !Array.isArray(res) || res.length < 2) {
+          break;
+        }
+
+        cursor = String(res[0] ?? '0-0');
+        const messages = Array.isArray(res[1]) ? res[1] : [];
+
+        // If no messages claimed and cursor didn't advance, we're done
+        if (messages.length === 0 && (cursor === '0-0' || ++safety > 100)) {
+          break;
+        }
+
+        // Continue until cursor wraps to 0-0 (no more)
+        if (cursor === '0-0' && messages.length === 0) {
+          break;
+        }
+      }
+    } catch (e) {
+      this.logger.debug?.(
+        `XAUTOCLAIM failed on stream ${stream}, group ${group}: ${e}`,
+      );
     }
   }
 
