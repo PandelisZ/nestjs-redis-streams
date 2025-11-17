@@ -185,6 +185,8 @@ export class RedisStreamClient extends ClientProxy {
     if (!fromPacket) {
       partialPacket.data.correlationId = correlationId;
     }
+    // mark event type so server can decide whether to publish a response
+    partialPacket.data.streamType = 'emit';
     return new Promise(() => this.publishStream(partialPacket));
   }
 
@@ -203,6 +205,9 @@ export class RedisStreamClient extends ClientProxy {
       }
 
       this.requestsMap.addEntry(correlationId, callback);
+
+      // mark event type so server publishes a response back to client
+      partialPacket.data.streamType = 'send';
 
       this.publishStream(partialPacket);
     } catch (error) {
