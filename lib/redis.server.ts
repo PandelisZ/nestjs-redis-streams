@@ -334,7 +334,8 @@ export class RedisStreamStrategy
 
       for (const result of results) {
         const [stream, messages] = result;
-        await this.notifyHandlers(stream, messages);
+        // Process messages concurrently without blocking the read loop
+        void this.notifyHandlers(stream, messages);
       }
 
       return this.listenOnStreams();
